@@ -1,290 +1,603 @@
-name: Build llama.cpp with CUDA
+name: Build llama.cpp CUDA SM86
 
 on:
   schedule:
-    # Run daily at 00:00 UTC
-    - cron: '0 0 * * *'
+    # Daily check at 00:17 UTC (08:17 Asia/Taipei)
+    - cron: "17 0 * * *"
   workflow_dispatch:
     inputs:
       force_build:
-        description: 'Force build even if no new release'
+        description: "Force rebuild the latest upstream release"
         required: false
         type: boolean
         default: false
 
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: llama-cpp-cuda-build
+  cancel-in-progress: false
+
+env:
+  CUDA_VERSION: "12.8.1"
+  CUDA_VERSION_SHORT: "12.8"
+  CUDA_IMAGE: "nvidia/cuda:12.8.1-devel-ubuntu22.04"
+
+  # RTX 3090 = SM86. "-real" only emits native SASS, avoiding extra PTX.
+  # For 3090 + 4090 later, change to: 86-real;89-real
+  CUDA_ARCHS: "86-real"
+  ARCH_LABEL: "sm86"
+
+  CCACHE_DIR: "${{ github.workspace }}/.ccache"
+  CCACHE_MAXSIZE: "2G"
+  CCACHE_PREFIX: "llama-cuda12.8-sm86"
+  KEEP_CCACHE_COUNT: "3"
+
+  # Release retention:
+  # - always keep the newest 15 releases
+  # - additionally keep the last release of every calendar month
+  KEEP_RECENT_RELEASES: "15"
+
 jobs:
   check-release:
+    name: Check upstream release
     runs-on: ubuntu-latest
     outputs:
       should_build: ${{ steps.check.outputs.should_build }}
       release_tag: ${{ steps.check.outputs.release_tag }}
       release_hash: ${{ steps.check.outputs.release_hash }}
+      force_rebuild: ${{ steps.check.outputs.force_rebuild }}
+
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
-      - name: Check for new llama.cpp release
+      - name: Check latest llama.cpp release
         id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
         run: |
-          # Get latest release from llama.cpp
-          LATEST_RELEASE=$(curl -s https://api.github.com/repos/ggml-org/llama.cpp/releases/latest | jq -r '.tag_name')
-          RELEASE_HASH=$(curl -s https://api.github.com/repos/ggml-org/llama.cpp/releases/latest | jq -r '.target_commitish')
-          
-          echo "Latest llama.cpp release: $LATEST_RELEASE"
-          echo "Release hash: $RELEASE_HASH"
-          
-          # Check if we've already built this release
-          if git tag | grep -q "^${LATEST_RELEASE}$"; then
-            echo "Release $LATEST_RELEASE already built"
-            if [ "${{ github.event.inputs.force_build }}" = "true" ]; then
-              echo "Force build enabled, building anyway"
-              echo "should_build=true" >> $GITHUB_OUTPUT
+          set -euo pipefail
+
+          API="https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
+
+          LATEST_JSON="$(
+            curl -fsSL \
+              --retry 3 \
+              --retry-delay 2 \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "${API}"
+          )"
+
+          LATEST_RELEASE="$(jq -er '.tag_name' <<<"${LATEST_JSON}")"
+
+          # Resolve the actual commit pointed to by the upstream tag.
+          RELEASE_HASH="$(
+            git ls-remote https://github.com/ggml-org/llama.cpp.git \
+              "refs/tags/${LATEST_RELEASE}^{}" |
+              awk 'NR == 1 {print $1}'
+          )"
+
+          if [[ -z "${RELEASE_HASH}" ]]; then
+            RELEASE_HASH="$(
+              git ls-remote https://github.com/ggml-org/llama.cpp.git \
+                "refs/tags/${LATEST_RELEASE}" |
+                awk 'NR == 1 {print $1}'
+            )"
+          fi
+
+          if [[ -z "${RELEASE_HASH}" ]]; then
+            echo "::error::Unable to resolve upstream tag ${LATEST_RELEASE}"
+            exit 1
+          fi
+
+          FORCE_REBUILD="false"
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.force_build }}" == "true" ]]; then
+            FORCE_REBUILD="true"
+          fi
+
+          echo "Latest upstream release: ${LATEST_RELEASE}"
+          echo "Upstream commit:        ${RELEASE_HASH}"
+          echo "Force rebuild:          ${FORCE_REBUILD}"
+
+          if gh api \
+              -H "Accept: application/vnd.github+json" \
+              "/repos/${GITHUB_REPOSITORY}/releases/tags/${LATEST_RELEASE}" \
+              >/dev/null 2>&1; then
+            echo "Release ${LATEST_RELEASE} already exists in this repository."
+
+            if [[ "${FORCE_REBUILD}" == "true" ]]; then
+              SHOULD_BUILD="true"
             else
-              echo "should_build=false" >> $GITHUB_OUTPUT
+              SHOULD_BUILD="false"
             fi
           else
-            echo "New release detected: $LATEST_RELEASE"
-            echo "should_build=true" >> $GITHUB_OUTPUT
+            echo "New upstream release detected: ${LATEST_RELEASE}"
+            SHOULD_BUILD="true"
           fi
-          
-          echo "release_tag=$LATEST_RELEASE" >> $GITHUB_OUTPUT
-          echo "release_hash=$RELEASE_HASH" >> $GITHUB_OUTPUT
+
+          {
+            echo "should_build=${SHOULD_BUILD}"
+            echo "release_tag=${LATEST_RELEASE}"
+            echo "release_hash=${RELEASE_HASH}"
+            echo "force_rebuild=${FORCE_REBUILD}"
+          } >> "${GITHUB_OUTPUT}"
 
   build:
+    name: Build CUDA 12.8 SM86
     needs: check-release
     if: needs.check-release.outputs.should_build == 'true'
-    runs-on: ${{ matrix.arch.runs_on }}
-    strategy:
-      fail-fast: false
-      matrix:
-        cuda_version: ['12.8.1']
-        arch:
-          # Native runners — no QEMU. nvidia/cuda:*-cudnn-devel-ubuntu22.04 is
-          # multi-arch on Docker Hub so the same build path runs on both.
-          - { suffix: amd64, runs_on: ubuntu-latest }
-          - { suffix: arm64, runs_on: ubuntu-24.04-arm }
-        include:
-          - cuda_version: '12.8.1'
-            cuda_version_short: '12.8'
-            cuda_tag: '12.8.1-cudnn-devel-ubuntu22.04'
-            # CUDA compute capabilities target the runtime GPU, not the host
-            # CPU arch, so the same list applies to both amd64 and arm64
-            # builds. Relevant aarch64 GPU contexts (Grace Hopper, Grace
-            # Blackwell, DGX Spark) are covered by sm_90 / sm_100 / sm_120.
-            architectures: '75-virtual;80-virtual;86-virtual;89-virtual;90-virtual;100-virtual;120-virtual'
-    
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
-      - name: Maximize build space
+      - name: Free runner disk space
+        shell: bash
         run: |
-          echo "=== Initial Disk Space ==="
+          set -euxo pipefail
+
           df -h
-          
-          echo "=== Removing unnecessary packages ==="
-          sudo apt-get remove -y '^aspnetcore-.*' || true
-          sudo apt-get remove -y '^dotnet-.*' --fix-missing || true
-          sudo apt-get remove -y '^llvm-.*' --fix-missing || true
-          sudo apt-get remove -y 'php.*' --fix-missing || true
-          sudo apt-get remove -y '^mongodb-.*' --fix-missing || true
-          sudo apt-get remove -y '^mysql-.*' --fix-missing || true
-          sudo apt-get remove -y azure-cli google-chrome-stable firefox powershell mono-devel libgl1-mesa-dri --fix-missing || true
-          sudo apt-get autoremove -y || true
-          sudo apt-get clean || true
-          
-          echo "=== Removing large directories ==="
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
-          sudo rm -rf /usr/local/share/boost
-          sudo rm -rf /usr/share/swift
-          sudo rm -rf /usr/local/.ghcup
-          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
-          
-          # Clean docker system
+
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+          sudo rm -rf /usr/local/share/boost || true
+          sudo rm -rf /usr/share/swift || true
+          sudo rm -rf /usr/local/.ghcup || true
+
           docker system prune -af || true
-          
-          echo "=== After Cleanup ==="
+
+          echo "=== Disk space after cleanup ==="
           df -h
 
-      - name: Build llama.cpp with CUDA
-        run: |
-          # Pull Docker image
-          docker pull nvidia/cuda:${{ matrix.cuda_tag }}
-          
-          # Run build in container
-          docker run --rm \
-            -v $PWD:/workspace \
-            nvidia/cuda:${{ matrix.cuda_tag }} \
-            bash -c "
-              set -e
-              
-              echo '=== Installing minimal dependencies ==='
-              apt-get update -qq
-              apt-get install -y --no-install-recommends git cmake ninja-build build-essential libssl-dev ca-certificates
-              apt-get clean
-              rm -rf /var/lib/apt/lists/*
-              
-              echo '=== Cloning llama.cpp ==='
-              cd /workspace
-              git clone --depth 1 --branch ${{ needs.check-release.outputs.release_tag }} https://github.com/ggml-org/llama.cpp.git || \
-                (git clone https://github.com/ggml-org/llama.cpp.git && cd llama.cpp && git checkout ${{ needs.check-release.outputs.release_hash }})
-              cd llama.cpp
-              
-              echo '=== Configuring build with Ninja ==='
-              export LIBRARY_PATH="/usr/local/cuda/lib64/stubs${LIBRARY_PATH:+:$LIBRARY_PATH}"
+      # Each upstream tag gets a new immutable Actions cache key.
+      # restore-keys automatically pulls the newest previous cache, so b10442
+      # can reuse almost everything compiled for b10441, while the newly
+      # updated cache is still saved under the new tag.
+      - name: Restore ccache
+        id: ccache-restore
+        uses: actions/cache/restore@v5
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ env.CCACHE_PREFIX }}-${{ runner.os }}-${{ needs.check-release.outputs.release_tag }}
+          restore-keys: |
+            ${{ env.CCACHE_PREFIX }}-${{ runner.os }}-
+            ${{ env.CCACHE_PREFIX }}-
 
-              ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
-              cmake -B build -S . \
+      - name: Prepare ccache
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p "${CCACHE_DIR}"
+
+          echo "ccache path: ${CCACHE_DIR}"
+          echo "ccache max:  ${CCACHE_MAXSIZE}"
+          echo "cache hit:   ${{ steps.ccache-restore.outputs.cache-hit }}"
+
+          du -sh "${CCACHE_DIR}" 2>/dev/null || true
+
+      - name: Pull CUDA build image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker pull "${CUDA_IMAGE}"
+
+      - name: Build llama.cpp
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TAG="${{ needs.check-release.outputs.release_tag }}"
+          HASH="${{ needs.check-release.outputs.release_hash }}"
+
+          rm -rf llama.cpp binaries
+          mkdir -p binaries
+
+          docker run --rm \
+            -v "${PWD}:/workspace" \
+            -v "${CCACHE_DIR}:/ccache" \
+            -e RELEASE_TAG="${TAG}" \
+            -e RELEASE_HASH="${HASH}" \
+            -e CUDA_ARCHS="${CUDA_ARCHS}" \
+            -e CCACHE_DIR="/ccache" \
+            -e CCACHE_MAXSIZE="${CCACHE_MAXSIZE}" \
+            "${CUDA_IMAGE}" \
+            bash -lc '
+              set -euo pipefail
+
+              export DEBIAN_FRONTEND=noninteractive
+
+              echo "=== Install minimal build dependencies ==="
+              apt-get update -qq
+              apt-get install -y --no-install-recommends \
+                ca-certificates \
+                ccache \
+                cmake \
+                git \
+                ninja-build \
+                build-essential \
+                libssl-dev \
+                pkg-config
+              rm -rf /var/lib/apt/lists/*
+
+              echo "=== Configure ccache ==="
+              mkdir -p "${CCACHE_DIR}"
+
+              # The compiler/container version is pinned by CUDA_IMAGE, so
+              # compiler_check=none avoids repeatedly hashing huge nvcc files.
+              ccache --set-config=cache_dir="${CCACHE_DIR}"
+              ccache --set-config=max_size="${CCACHE_MAXSIZE}"
+              ccache --set-config=compression=true
+              ccache --set-config=compression_level=6
+              ccache --set-config=compiler_check=none
+              ccache --set-config=hash_dir=false
+              ccache --set-config=hard_link=false
+
+              export CCACHE_BASEDIR="/workspace/llama.cpp"
+              export CCACHE_NOHASHDIR="true"
+              export CCACHE_COMPILERCHECK="none"
+              export CCACHE_NOHARDLINK="true"
+
+              # Reset stats only; cached objects are preserved.
+              ccache --zero-stats || true
+              ccache --show-stats || true
+
+              echo "=== Clone llama.cpp ${RELEASE_TAG} ==="
+              cd /workspace
+
+              git clone \
+                --filter=blob:none \
+                --no-checkout \
+                https://github.com/ggml-org/llama.cpp.git \
+                llama.cpp
+
+              cd llama.cpp
+              git fetch --depth 1 origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+              git checkout --detach "${RELEASE_HASH}"
+
+              echo "=== Configure CUDA build ==="
+              export LIBRARY_PATH="/usr/local/cuda/lib64/stubs${LIBRARY_PATH:+:${LIBRARY_PATH}}"
+              ln -sf \
+                /usr/local/cuda/lib64/stubs/libcuda.so \
+                /usr/local/cuda/lib64/stubs/libcuda.so.1
+
+              cmake -S . -B build \
                 -G Ninja \
                 -DGGML_CUDA=ON \
-                -DCMAKE_CUDA_ARCHITECTURES='${{ matrix.architectures }}' \
+                -DGGML_CUDA_NCCL=OFF \
+                -DGGML_NATIVE=OFF \
+                -DGGML_CCACHE=ON \
+                -DGGML_CUDA_COMPRESSION_MODE=size \
+                -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHS}" \
                 -DCMAKE_BUILD_TYPE=Release \
                 -DBUILD_SHARED_LIBS=ON \
-                -DGGML_NATIVE=OFF \
                 -DLLAMA_BUILD_TESTS=OFF \
                 -DLLAMA_BUILD_EXAMPLES=OFF \
-                -DCMAKE_EXE_LINKER_FLAGS='-Wl,-rpath-link,/usr/local/cuda/lib64/stubs' \
-                -DCMAKE_SHARED_LINKER_FLAGS='-Wl,-rpath-link,/usr/local/cuda/lib64/stubs'
-              
-              echo '=== Building with Ninja (parallel: all cores) ==='
-              cmake --build build --config Release -j\$(nproc)
-              
-              echo '=== Copying binaries ==='
-              cd /workspace
-              mkdir -p binaries/cuda-${{ matrix.cuda_version_short }}
+                -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+                -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+                -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache \
+                -DCMAKE_EXE_LINKER_FLAGS="-Wl,-rpath-link,/usr/local/cuda/lib64/stubs" \
+                -DCMAKE_SHARED_LINKER_FLAGS="-Wl,-rpath-link,/usr/local/cuda/lib64/stubs"
 
-              # Copy everything from build/bin
-              cp -r llama.cpp/build/bin/* binaries/cuda-${{ matrix.cuda_version_short }}/
+              echo "=== Build with Ninja ==="
+              cmake --build build --config Release -j"$(nproc)"
 
-              # Strip binaries to reduce size (executables only, not .so files)
-              find binaries/cuda-${{ matrix.cuda_version_short }}/ -type f -executable ! -name "*.so*" -exec strip {} \; 2>/dev/null || true
+              echo "=== ccache stats ==="
+              ccache --show-stats
+              ccache --show-compression || true
 
-              echo '=== Creating version info ==='
-              echo 'llama.cpp version: ${{ needs.check-release.outputs.release_tag }}' > binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
-              echo 'CUDA version: ${{ matrix.cuda_version }}' >> binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
-              echo 'Architectures: ${{ matrix.architectures }}' >> binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
-              echo 'Build date: '$(date -u +%Y-%m-%d) >> binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
-              echo 'Build hash: ${{ needs.check-release.outputs.release_hash }}' >> binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
+              echo "=== Package build/bin ==="
+              OUT="/workspace/binaries/llama-${RELEASE_TAG}-linux-cuda12.8-sm86-x64"
+              mkdir -p "${OUT}"
 
-              echo '=== Build complete ==='
-              ls -lh binaries/cuda-${{ matrix.cuda_version_short }}/
-              
-              echo '=== Cleaning up build directory ==='
-              rm -rf llama.cpp
-            "
-          
-          # Remove Docker image to free space
-          docker rmi nvidia/cuda:${{ matrix.cuda_tag }} || true
-          
-          # Fix permissions for files created by root in container
-          sudo chown -R $(id -u):$(id -g) $PWD
-          
-          echo "=== Final disk usage ==="
-          df -h
+              # Keep upstream build/bin intact so newly-added helper libraries
+              # are not accidentally omitted by a hand-maintained allowlist.
+              cp -a build/bin/. "${OUT}/"
 
-      - name: Create tarball
+              # Strip executables and our shared libraries. Failure on scripts
+              # or non-ELF files is harmless.
+              find "${OUT}" -maxdepth 1 -type f -executable \
+                -exec strip --strip-unneeded {} + 2>/dev/null || true
+
+              find "${OUT}" -maxdepth 1 -type f -name "*.so*" \
+                -exec strip --strip-unneeded {} + 2>/dev/null || true
+
+              printf "%s\n" \
+                "llama.cpp version: ${RELEASE_TAG}" \
+                "llama.cpp commit: ${RELEASE_HASH}" \
+                "CUDA version: 12.8.1" \
+                "CUDA architectures: ${CUDA_ARCHS}" \
+                "NCCL: OFF" \
+                "Host architecture: x86_64" \
+                "Build date: $(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                > "${OUT}/VERSION.txt"
+
+              echo "=== Build output ==="
+              du -sh "${OUT}"
+              ls -lh "${OUT}" | head -100
+            '
+
+          # Container writes as root.
+          sudo chown -R "$(id -u):$(id -g)" "${CCACHE_DIR}" binaries
+
+          echo "=== Host ccache size ==="
+          du -sh "${CCACHE_DIR}" || true
+
+      - name: Create release tarball and checksum
+        id: package
+        shell: bash
         run: |
-          cd binaries
-          tar -czf llama.cpp-${{ needs.check-release.outputs.release_tag }}-cuda-${{ matrix.cuda_version_short }}-${{ matrix.arch.suffix }}.tar.gz cuda-${{ matrix.cuda_version_short }}
-          ls -lh *.tar.gz
+          set -euo pipefail
 
-      - name: Upload artifact
+          TAG="${{ needs.check-release.outputs.release_tag }}"
+          DIR="llama-${TAG}-linux-cuda12.8-sm86-x64"
+          ARCHIVE="${DIR}.tar.zst"
+
+          cd binaries
+
+          # zstd decompresses much faster than gzip and generally gives a
+          # better size/speed balance for release binaries.
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends zstd
+          sudo rm -rf /var/lib/apt/lists/*
+
+          tar --zstd -cf "${ARCHIVE}" "${DIR}"
+          sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256"
+
+          echo "archive=${ARCHIVE}" >> "${GITHUB_OUTPUT}"
+
+          ls -lh "${ARCHIVE}" "${ARCHIVE}.sha256"
+
+      - name: Save updated ccache
+        if: steps.ccache-restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ env.CCACHE_PREFIX }}-${{ runner.os }}-${{ needs.check-release.outputs.release_tag }}
+
+      - name: Keep only newest ccache snapshots
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PREFIX="${CCACHE_PREFIX}-${RUNNER_OS}-"
+          KEEP="${KEEP_CCACHE_COUNT}"
+
+          echo "Keeping newest ${KEEP} caches with prefix: ${PREFIX}"
+
+          # Get matching repository caches, newest first, and remove older ones.
+          mapfile -t OLD_CACHE_IDS < <(
+            gh api \
+              -H "Accept: application/vnd.github+json" \
+              "/repos/${GITHUB_REPOSITORY}/actions/caches?per_page=100" \
+              --jq ".actions_caches
+                    | map(select(.key | startswith(\"${PREFIX}\")))
+                    | sort_by(.created_at)
+                    | reverse
+                    | .[${KEEP}:]
+                    | .[].id"
+          )
+
+          for id in "${OLD_CACHE_IDS[@]:-}"; do
+            [[ -z "${id}" ]] && continue
+            echo "Deleting old Actions cache id=${id}"
+            gh api \
+              --method DELETE \
+              -H "Accept: application/vnd.github+json" \
+              "/repos/${GITHUB_REPOSITORY}/actions/caches/${id}" || true
+          done
+
+      - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          # Arch suffix in the artifact name so the matrix jobs do not collide
-          # in actions/download-artifact later.
-          name: llama.cpp-cuda-${{ matrix.cuda_version_short }}-${{ matrix.arch.suffix }}
-          path: binaries/*.tar.gz
+          name: llama-${{ needs.check-release.outputs.release_tag }}-linux-cuda12.8-sm86-x64
+          path: |
+            binaries/*.tar.zst
+            binaries/*.sha256
+          if-no-files-found: error
           retention-days: 1
 
+      - name: Remove CUDA image
+        if: always()
+        shell: bash
+        run: |
+          docker rmi "${CUDA_IMAGE}" || true
+          docker system prune -af || true
+
   release:
+    name: Publish GitHub Release
     needs: [check-release, build]
+    if: needs.build.result == 'success'
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
+
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
-          # Full history + tags so the tag push below is a fast-forward and
-          # duplicate tags are visible.
           fetch-depth: 0
 
-      - name: Download all artifacts
+      - name: Download build artifact
         uses: actions/download-artifact@v4
         with:
           path: artifacts
 
       - name: Prepare release assets
-        run: |
-          mkdir -p release-assets
-          find artifacts -name "*.tar.gz" -exec cp {} release-assets/ \;
-          ls -lh release-assets/
-
-      - name: Create advancing release tag
-        # GitHub sorts the /releases list by each release's created_at, which is
-        # the *committer date of the tag's target commit* — not the publish
-        # time. Previously softprops/action-gh-release created every tag at the
-        # static main HEAD (unchanged since May 2026), so every release reported
-        # the same created_at and the /releases list stopped reflecting recency:
-        # API consumers polling the first page never saw newer builds. Anchor
-        # each tag to a fresh empty commit whose committer date is build time so
-        # created_at advances and new releases sort to the top of the list.
-        # The commit is reachable only via its tag; main is never pushed.
+        shell: bash
         run: |
           set -euo pipefail
+
+          mkdir -p release-assets
+          find artifacts -type f \( -name "*.tar.zst" -o -name "*.sha256" \) \
+            -exec cp -v {} release-assets/ \;
+
+          test -n "$(find release-assets -type f -name '*.tar.zst' -print -quit)"
+          ls -lh release-assets
+
+      - name: Replace existing release on forced rebuild
+        if: needs.check-release.outputs.force_rebuild == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
           TAG="${{ needs.check-release.outputs.release_tag }}"
-          git config user.name  "github-actions[bot]"
+
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "Deleting existing release ${TAG} before forced republish..."
+            gh release delete "${TAG}" --yes --cleanup-tag
+          fi
+
+      # A fresh empty commit gives every release tag a current commit date,
+      # avoiding GitHub's release-list sorting problem when all tags point at
+      # the same old main commit.
+      - name: Create advancing release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TAG="${{ needs.check-release.outputs.release_tag }}"
+
+          git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "::error::Tag ${TAG} already exists unexpectedly."
+            exit 1
+          fi
+
           git commit --allow-empty \
-            -m "llama.cpp ${TAG} (CUDA build $(date -u +%Y-%m-%dT%H:%M:%SZ))"
+            -m "llama.cpp ${TAG} CUDA 12.8 SM86 ($(date -u +%Y-%m-%dT%H:%M:%SZ))"
+
           git tag "${TAG}"
           git push origin "refs/tags/${TAG}"
 
-      - name: Create Release
-        uses: softprops/action-gh-release@v1
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.check-release.outputs.release_tag }}
-          name: llama.cpp ${{ needs.check-release.outputs.release_tag }} with CUDA
-          body: |
-            # llama.cpp ${{ needs.check-release.outputs.release_tag }} with CUDA Support
-            
-            Pre-built binaries of llama.cpp with CUDA support for multiple CUDA versions.
-            
-            **Source:** https://github.com/ggml-org/llama.cpp/releases/tag/${{ needs.check-release.outputs.release_tag }}
-            **Commit:** ${{ needs.check-release.outputs.release_hash }}
-            
-            ## CUDA Versions
-            - CUDA 12.8 - GPU compute capabilities: 7.5, 8.0, 8.6, 8.9, 9.0, 10.0, 12.0
-
-            ## Host architectures
-            Tarballs are published per host CPU architecture (Linux):
-            - `-amd64.tar.gz` — x86_64 (most desktops, servers, cloud VMs)
-            - `-arm64.tar.gz` — aarch64 (Grace Hopper / Grace Blackwell / DGX Spark / Ampere Altra)
-
-            ## GPU compute capability reference
-            - 7.5: Tesla T4, RTX 20xx series, Quadro RTX
-            - 8.0: A100
-            - 8.6: RTX 3000 series
-            - 8.9: RTX 4000 series, L4, L40
-            - 9.0: H100, H200, GH200
-            - 10.0: B200, GB200
-            - 12.0: RTX Pro series, RTX 50xx
-
-            ## Usage
-            Download the tarball matching your host CPU arch and CUDA version, then extract:
-            ```bash
-            # amd64 host
-            tar -xzf llama.cpp-${{ needs.check-release.outputs.release_tag }}-cuda-12.8-amd64.tar.gz
-            # arm64 host (e.g. Grace Blackwell)
-            tar -xzf llama.cpp-${{ needs.check-release.outputs.release_tag }}-cuda-12.8-arm64.tar.gz
-            ./llama-cli --help
-            ```
+          name: llama.cpp ${{ needs.check-release.outputs.release_tag }} - CUDA 12.8 SM86
           files: release-assets/*
+          fail_on_unmatched_files: true
           draft: false
           prerelease: false
+          generate_release_notes: false
+          body: |
+            ## llama.cpp CUDA build
+
+            - Upstream: https://github.com/ggml-org/llama.cpp/releases/tag/${{ needs.check-release.outputs.release_tag }}
+            - Commit: `${{ needs.check-release.outputs.release_hash }}`
+            - Host: Linux x86_64 / Ubuntu
+            - CUDA build image: `${{ env.CUDA_IMAGE }}`
+            - GPU architecture: **SM86 / RTX 30 series**
+            - NCCL: **OFF**
+            - CUDA runtime / cuBLAS: **not bundled**
+            - Package: `.tar.zst` + SHA256
+
+            This is a thin CUDA build. The target machine must provide a compatible
+            NVIDIA driver and CUDA 12.x runtime libraries.
+
+  prune-releases:
+    name: Prune old releases
+    needs: [check-release, release]
+    if: needs.release.result == 'success'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Keep latest 15 + last release of every month
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          KEEP_RECENT="${KEEP_RECENT_RELEASES}"
+
+          TMP="$(mktemp -d)"
+          trap 'rm -rf "${TMP}"' EXIT
+
+          echo "Fetching release history..."
+
+          # --paginate emits one row per release across all pages.
+          gh api --paginate \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+            --jq '.[] |
+                  select(.draft == false and .prerelease == false) |
+                  [.id, .tag_name, .published_at] |
+                  @tsv' \
+            > "${TMP}/all.tsv"
+
+          # Only manage llama.cpp-style bNNNN tags. Other releases are untouched.
+          awk -F'\t' '$2 ~ /^b[0-9]+$/ && $3 != ""' \
+            "${TMP}/all.tsv" \
+            | sort -t$'\t' -k3,3r \
+            > "${TMP}/sorted.tsv"
+
+          TOTAL="$(wc -l < "${TMP}/sorted.tsv" | tr -d ' ')"
+          echo "Managed releases: ${TOTAL}"
+
+          if [[ "${TOTAL}" -le "${KEEP_RECENT}" ]]; then
+            echo "Nothing to prune: ${TOTAL} <= ${KEEP_RECENT}"
+            exit 0
+          fi
+
+          # 1) Always keep newest N releases.
+          head -n "${KEEP_RECENT}" "${TMP}/sorted.tsv" \
+            | cut -f2 \
+            > "${TMP}/keep.txt"
+
+          # 2) sorted.tsv is newest-first, so the first row seen for YYYY-MM is
+          #    exactly the last (newest) release published in that month.
+          awk -F'\t' '
+            {
+              month = substr($3, 1, 7)
+              if (!seen[month]++) {
+                print $2
+              }
+            }
+          ' "${TMP}/sorted.tsv" >> "${TMP}/keep.txt"
+
+          sort -u "${TMP}/keep.txt" -o "${TMP}/keep.txt"
+
+          echo "=== Releases to keep ==="
+          cat "${TMP}/keep.txt"
+
+          echo "=== Pruning ==="
+
+          while IFS=$'\t' read -r release_id tag published_at; do
+            if grep -Fxq "${tag}" "${TMP}/keep.txt"; then
+              continue
+            fi
+
+            echo "Deleting ${tag} (${published_at})"
+
+            # Delete release object.
+            gh api \
+              --method DELETE \
+              -H "Accept: application/vnd.github+json" \
+              "/repos/${GITHUB_REPOSITORY}/releases/${release_id}"
+
+            # Delete its tag as well so stale release tags do not accumulate.
+            gh api \
+              --method DELETE \
+              -H "Accept: application/vnd.github+json" \
+              "/repos/${GITHUB_REPOSITORY}/git/refs/tags/${tag}" \
+              >/dev/null 2>&1 || true
+
+          done < "${TMP}/sorted.tsv"
