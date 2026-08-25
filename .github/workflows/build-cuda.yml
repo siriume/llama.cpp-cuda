@@ -73,7 +73,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Get latest official llama.cpp release
+      - name: Get latest official llama.cpp nightly release
         id: check
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -81,30 +81,57 @@ jobs:
         run: |
           set -euo pipefail
 
-          API="https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
+          API="https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=100"
+
+          echo "Fetching official llama.cpp releases..."
 
           JSON="$(
             curl -fsSL \
               --retry 4 \
               --retry-delay 2 \
               -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
               -H "X-GitHub-Api-Version: 2022-11-28" \
               "${API}"
           )"
 
-          TAG="$(jq -er '.tag_name' <<<"${JSON}")"
+          # llama.cpp currently has multiple tag streams:
+          #
+          #   bNNNNN   -> nightly/dev builds
+          #   vX.Y.Z   -> stable/semver releases
+          #
+          # We explicitly follow only bNNNNN and select the largest build number.
+          TAG="$(
+            jq -er '
+              [
+                .[]
+                | select(.draft == false)
+                | select(.tag_name | test("^b[0-9]+$"))
+                | {
+                    tag: .tag_name,
+                    build: (.tag_name[1:] | tonumber)
+                  }
+              ]
+              | max_by(.build)
+              | .tag
+            ' <<<"${JSON}"
+          )"
 
-          if [[ ! "${TAG}" =~ ^b[0-9]+$ ]]; then
-            echo "::error::Unexpected upstream tag: ${TAG}"
+          if [[ -z "${TAG}" || ! "${TAG}" =~ ^b[0-9]+$ ]]; then
+            echo "::error::Unable to find official llama.cpp bNNNN nightly release"
             exit 1
           fi
 
+          echo "Latest official nightly tag: ${TAG}"
+
+          # Resolve annotated tag first.
           HASH="$(
             git ls-remote https://github.com/ggml-org/llama.cpp.git \
               "refs/tags/${TAG}^{}" |
               awk 'NR == 1 {print $1}'
           )"
 
+          # Fallback for lightweight tags.
           if [[ -z "${HASH}" ]]; then
             HASH="$(
               git ls-remote https://github.com/ggml-org/llama.cpp.git \
@@ -118,29 +145,42 @@ jobs:
             exit 1
           fi
 
+          echo "Official commit: ${HASH}"
+
           FORCE="false"
+
           if [[ "${{ github.event_name }}" == "workflow_dispatch" &&
                 "${{ inputs.force_build }}" == "true" ]]; then
             FORCE="true"
           fi
 
+          echo "Force build: ${FORCE}"
+
+          # Check whether our repository already published the same official tag.
           if gh release view "${TAG}" \
-               --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+               --repo "${GITHUB_REPOSITORY}" \
+               >/dev/null 2>&1; then
+
             if [[ "${FORCE}" == "true" ]]; then
               SHOULD_BUILD="true"
-              echo "Release ${TAG} exists, but force_build=true."
+              echo "Release ${TAG} already exists, but force_build=true."
             else
               SHOULD_BUILD="false"
-              echo "Release ${TAG} already exists; nothing to build."
+              echo "Release ${TAG} already exists; skip build."
             fi
+
           else
             SHOULD_BUILD="true"
-            echo "New official llama.cpp release detected: ${TAG}"
+            echo "New official llama.cpp nightly detected: ${TAG}"
           fi
 
+          echo
+          echo "======================================"
           echo "Official tag:    ${TAG}"
           echo "Official commit: ${HASH}"
+          echo "Force build:     ${FORCE}"
           echo "Should build:    ${SHOULD_BUILD}"
+          echo "======================================"
 
           {
             echo "release_tag=${TAG}"
