@@ -627,7 +627,10 @@ jobs:
       - name: Checkout build repository
         uses: actions/checkout@v6
         with:
-          fetch-depth: 0
+          fetch-depth: 1
+          fetch-tags: false
+          token: ${{ secrets.RELEASE_PAT }}
+          persist-credentials: true
 
       - name: Download all build artifacts
         uses: actions/download-artifact@v4
