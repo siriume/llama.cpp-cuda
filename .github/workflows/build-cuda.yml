@@ -484,6 +484,13 @@ jobs:
                 /usr/local/cuda/lib64/stubs/libcuda.so \
                 /usr/local/cuda/lib64/stubs/libcuda.so.1
 
+              # Keep normal tools, but build only explicitly requested examples.
+              # Exclude deprecated warning executables from the default target.
+              printf "%s\n" \
+                "set_property(DIRECTORY examples PROPERTY EXCLUDE_FROM_ALL TRUE)" \
+                "set_property(TARGET llama-gemma3-cli llama-llava-cli llama-minicpmv-cli llama-qwen2vl-cli PROPERTY EXCLUDE_FROM_ALL TRUE)" \
+                >> CMakeLists.txt
+
               cmake -S . -B build \
                 -G Ninja \
                 -DGGML_CUDA=ON \
@@ -495,7 +502,11 @@ jobs:
                 -DCMAKE_BUILD_TYPE=Release \
                 -DBUILD_SHARED_LIBS=ON \
                 -DLLAMA_BUILD_TESTS=OFF \
-                -DLLAMA_BUILD_EXAMPLES=OFF \
+                -DLLAMA_BUILD_EXAMPLES=ON \
+                -DLLAMA_BUILD_TOOLS=ON \
+                -DLLAMA_BUILD_SERVER=ON \
+                -DCMAKE_BUILD_RPATH_USE_ORIGIN=ON \
+                -DCMAKE_BUILD_RPATH="\$ORIGIN" \
                 -DCMAKE_C_COMPILER_LAUNCHER=ccache \
                 -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
                 -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache \
@@ -506,6 +517,7 @@ jobs:
 
               cmake --build build \
                 --config Release \
+                --target all llama-embedding llama-gguf-hash \
                 -j"$(nproc)"
 
               echo "=== Final ccache statistics ==="
@@ -520,6 +532,29 @@ jobs:
               mkdir -p "${OUT}"
 
               cp -a build/bin/. "${OUT}/"
+
+              echo "=== Verify packaged tools and library search paths ==="
+              test -x "${OUT}/llama-embedding"
+              test -x "${OUT}/llama-gguf-hash"
+
+              for name in llama-gemma3-cli llama-llava-cli llama-minicpmv-cli llama-qwen2vl-cli; do
+                if [[ -e "${OUT}/${name}" ]]; then
+                  echo "::error::Deprecated executable was packaged: ${name}"
+                  exit 1
+                fi
+              done
+
+              while IFS= read -r -d "" file; do
+                if ! readelf -h "${file}" >/dev/null 2>&1; then
+                  continue
+                fi
+                DYNAMIC="$(readelf -d "${file}")"
+                SEARCH_PATH="$(printf "%s\n" "${DYNAMIC}" | grep -E "RPATH|RUNPATH" || true)"
+                if [[ "${SEARCH_PATH}" != *"\$ORIGIN"* || "${SEARCH_PATH}" == *"/workspace/"* ]]; then
+                  echo "::error::Non-portable library search path: ${file}: ${SEARCH_PATH}"
+                  exit 1
+                fi
+              done < <(find "${OUT}" -maxdepth 1 -type f -print0)
 
               find "${OUT}" \
                 -maxdepth 1 \
