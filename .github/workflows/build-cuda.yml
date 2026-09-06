@@ -669,6 +669,7 @@ jobs:
             https://github.com/ggml-org/llama.cpp.git
 
           git fetch \
+            --no-tags \
             --force \
             llama-upstream \
             "refs/tags/${TAG}:refs/tags/${TAG}"
